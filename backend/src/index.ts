@@ -4,11 +4,15 @@ import express from 'express';
 import { z } from 'zod';
 import { makePool } from './db.js';
 import { createUploadUrl, getBucketName } from './storage.js';
+import { makePubSub } from './pubsub.js';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 const pool = makePool();
+
+const pubsub = makePubSub();
+const TOPIC = process.env.PUBSUB_TOPIC ?? 'photo-uploaded';
 
 app.get('/health', async (_req, res) => {
   const r = await pool.query('select 1 as ok');
@@ -99,6 +103,11 @@ app.post('/photos/:id/complete', async (req, res) => {
   );
 
   if (r.rowCount === 0) return res.status(404).json({ error: 'Not found' });
+
+  await pubsub.topic(TOPIC).publishMessage({
+    json: { photoId: r.rows[0].id },
+  });
+
   res.json(r.rows[0]);
 });
 

@@ -3,12 +3,11 @@
     "target": "ES2022",
     "module": "ES2022",
     "moduleResolution": "node",
-    "rootDir": "src",
     "outDir": "dist",
+    "rootDir": "src",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["worker/**", "dist/**", "node_modules/**"]
+  "include": ["src/**/*.ts"]
 }
