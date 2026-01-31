@@ -1,6 +1,7 @@
 FROM node:20-slim AS build
 WORKDIR /app
-COPY package.json tsconfig.json ./
+COPY package.json package-lock.json tsconfig.json ./
+RUN ls -la && echo "----" && ls -la /app
 RUN npm ci
 COPY src ./src
 COPY migrations ./migrations
