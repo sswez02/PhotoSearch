@@ -4,7 +4,7 @@ PhotoSearch is a production-style backend inspired by Google Photos ingestion wo
 
 **Core goals**
 
-- Keep the API fast and lightweight.
+- Keep the API fast and lightweight
 - Use an async pipeline for CPU/IO work
 - Demonstrate cloud-native deployment
 
@@ -16,6 +16,21 @@ A photos row progresses through a simple state machine:
 - UPLOADED: client confirmed upload complete
 - PROCESSED: worker extracted metadata and wrote thumbnail
 - ERROR: permanent failure (bad payload, missing object, etc.)
+
+## Measured results
+
+**API latency (Cloud Run, k6, 20 VUs, 30s):**
+
+- `POST /photos` p95: 55.6ms
+- `GET /photos?q=` p95: 62.5ms
+- Request failure rate: 0.00%
+- Throughput: ~203 req/s (overall)
+
+**Async processing latency (Cloud Run worker + Pub/Sub + Cloud SQL, n=50):**
+Time from `uploaded_at` → `processed_at`:
+
+- min: 175ms, avg: 337.1ms
+- p50: 279.5ms, p95: 849.3ms, max: 1367ms
 
 # APIs
 

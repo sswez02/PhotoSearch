@@ -9,6 +9,35 @@ import { makePubSub } from './pubsub.js';
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
+// Request correlation + structured access logs
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  const requestId = (req.header('x-request-id') ?? crypto.randomBytes(8).toString('hex')).slice(
+    0,
+    64,
+  );
+  res.setHeader('x-request-id', requestId);
+  (res.locals as any).requestId = requestId;
+
+  res.on('finish', () => {
+    const durMs = Number(process.hrtime.bigint() - start) / 1e6;
+    const photoId = req.params?.id ? Number(req.params.id) : undefined;
+    console.log(
+      JSON.stringify({
+        type: 'http_request',
+        request_id: requestId,
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        duration_ms: Math.round(durMs),
+        photo_id: Number.isFinite(photoId as any) ? photoId : undefined,
+      }),
+    );
+  });
+
+  next();
+});
+
 const pool = makePool();
 
 const pubsub = makePubSub();
@@ -128,9 +157,22 @@ app.post('/photos/:id/complete', async (req, res) => {
 
   const photo = r.rows[0];
 
-  await pubsub.topic(TOPIC).publishMessage({
+  const requestId = (res.locals as any).requestId as string | undefined;
+
+  const pubsubMessageId = await pubsub.topic(TOPIC).publishMessage({
     json: { photoId: photo.id },
+    attributes: requestId ? { requestId } : {},
   });
+
+  console.log(
+    JSON.stringify({
+      type: 'pubsub_publish',
+      request_id: requestId,
+      topic: TOPIC,
+      photo_id: photo.id,
+      pubsub_message_id: pubsubMessageId,
+    }),
+  );
 
   res.json(photo);
 });
@@ -145,6 +187,7 @@ app.get('/photos/:id', async (req, res) => {
   const r = await pool.query(
     `select id, original_filename, status, gcs_bucket, gcs_object, content_type, size_bytes,
             width, height, taken_at, exif_json, thumb_bucket, thumb_object, processed_at,
+            processing_ms, processed_attempt, error_reason, error_at,
             created_at, uploaded_at
      from photos
      where id = $1`,
@@ -158,7 +201,7 @@ app.get('/photos/:id', async (req, res) => {
 });
 
 /**
- * Generate a short-lived signed GET URL to fetch the thumbnail bytes from GCS.
+ * Generate a signed GET URL to fetch the thumbnail bytes from GCS
  */
 app.get('/photos/:id/thumbnail-url', async (req, res) => {
   const id = Number(req.params.id);
@@ -248,6 +291,7 @@ app.get('/photos', async (req, res) => {
     `
     select id, original_filename, status, gcs_bucket, gcs_object, content_type, size_bytes,
            width, height, taken_at, thumb_bucket, thumb_object, processed_at,
+           processing_ms, processed_attempt, error_reason, error_at,
            created_at, uploaded_at
     from photos
     ${whereSql}
