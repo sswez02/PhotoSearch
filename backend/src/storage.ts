@@ -36,3 +36,23 @@ export async function createUploadUrl(params: {
 
   return { uploadUrl };
 }
+
+export async function createDownloadUrl(params: {
+  bucket: string;
+  objectPath: string;
+  expiresInSeconds?: number;
+}): Promise<{ url: string }> {
+  const { bucket, objectPath } = params;
+  const expiresInSeconds = params.expiresInSeconds ?? 10 * 60;
+
+  const storage = makeStorage();
+  const file = storage.bucket(bucket).file(objectPath);
+
+  const [url] = await file.getSignedUrl({
+    version: 'v4',
+    action: 'read',
+    expires: Date.now() + expiresInSeconds * 1000,
+  });
+
+  return { url };
+}

@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import express from 'express';
 import { z } from 'zod';
 import { makePool } from './db.js';
-import { createUploadUrl, getBucketName } from './storage.js';
+import { createUploadUrl, createDownloadUrl, getBucketName } from './storage.js';
 import { makePubSub } from './pubsub.js';
 
 const app = express();
@@ -12,6 +12,7 @@ app.use(express.json({ limit: '1mb' }));
 const pool = makePool();
 
 const pubsub = makePubSub();
+
 const TOPIC = process.env.PUBSUB_TOPIC ?? 'photo-uploaded';
 
 app.get('/health', async (_req, res) => {
@@ -19,6 +20,12 @@ app.get('/health', async (_req, res) => {
   res.json({ ok: true, db: r.rows[0]?.ok === 1 });
 });
 
+/**
+ * Create a photo placeholder row and reserve a GCS object path
+ *
+ * - Generate the object path server-side
+ * - State machine starts at PENDING
+ */
 app.post('/photos', async (req, res) => {
   const schema = z.object({
     originalFilename: z.string().min(1).max(300),
@@ -29,9 +36,12 @@ app.post('/photos', async (req, res) => {
   const bucket = getBucketName();
 
   const datePrefix = new Date().toISOString().slice(0, 10);
+
   const rand = crypto.randomBytes(16).toString('hex');
+
   const safeName = body.originalFilename.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
 
+  // Reserved path for the original upload
   const objectPath = `uploads/${datePrefix}/${rand}_${safeName}`;
 
   const r = await pool.query(
@@ -44,6 +54,12 @@ app.post('/photos', async (req, res) => {
   res.status(201).json(r.rows[0]);
 });
 
+/**
+ * Generate a short-lived signed PUT URL so the client uploads bytes directly to GCS
+ *
+ * - Avoids proxying large file uploads through the API service
+ * - Reduces latency + egress + memory pressure on Cloud Run
+ */
 app.post('/photos/:id/upload-url', async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id' });
@@ -70,7 +86,7 @@ app.post('/photos/:id/upload-url', async (req, res) => {
     bucket: row.gcs_bucket,
     objectPath: row.gcs_object,
     contentType: body.contentType,
-    expiresInSeconds: 10 * 60,
+    expiresInSeconds: 10 * 60, // small TTL: reduces blast radius if leaked
   });
 
   res.json({
@@ -81,6 +97,12 @@ app.post('/photos/:id/upload-url', async (req, res) => {
   });
 });
 
+/**
+ * Client confirms upload is complete
+ *
+ * - Mark row UPLOADED
+ * - Publish a Pub/Sub message so the worker performs EXIF extraction + thumbnailing
+ */
 app.post('/photos/:id/complete', async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id' });
@@ -104,26 +126,145 @@ app.post('/photos/:id/complete', async (req, res) => {
 
   if (r.rowCount === 0) return res.status(404).json({ error: 'Not found' });
 
+  const photo = r.rows[0];
+
   await pubsub.topic(TOPIC).publishMessage({
-    json: { photoId: r.rows[0].id },
+    json: { photoId: photo.id },
   });
 
-  res.json(r.rows[0]);
+  res.json(photo);
 });
 
+/**
+ * Fetch one photo row (metadata + lifecycle state)
+ */
+app.get('/photos/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id' });
+
+  const r = await pool.query(
+    `select id, original_filename, status, gcs_bucket, gcs_object, content_type, size_bytes,
+            width, height, taken_at, exif_json, thumb_bucket, thumb_object, processed_at,
+            created_at, uploaded_at
+     from photos
+     where id = $1`,
+    [id],
+  );
+
+  const row = r.rows[0];
+  if (!row) return res.status(404).json({ error: 'Not found' });
+
+  res.json(row);
+});
+
+/**
+ * Generate a short-lived signed GET URL to fetch the thumbnail bytes from GCS.
+ */
+app.get('/photos/:id/thumbnail-url', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id' });
+
+  const r = await pool.query(
+    `select id, status, thumb_bucket, thumb_object
+     from photos
+     where id = $1`,
+    [id],
+  );
+
+  const row = r.rows[0];
+  if (!row) return res.status(404).json({ error: 'Not found' });
+
+  if (row.status !== 'PROCESSED') {
+    return res.status(409).json({ error: 'Photo not processed yet', status: row.status });
+  }
+
+  if (!row.thumb_bucket || !row.thumb_object) {
+    return res.status(500).json({ error: 'Missing thumbnail fields on row' });
+  }
+
+  const { url } = await createDownloadUrl({
+    bucket: row.thumb_bucket,
+    objectPath: row.thumb_object,
+    expiresInSeconds: 10 * 60,
+  });
+
+  res.json({ id: row.id, url });
+});
+
+/**
+ * List/search photos with optional filters
+ *
+ * - q: filename fuzzy match (pg_trgm) / substring fallback
+ * - from/to: taken_at range (EXIF-derived; may be null if missing)
+ *
+ * - taken_at can be null => those rows will be excluded from from/to filters
+ * - q uses the % trigram operator if pg_trgm is enabled
+ */
 app.get('/photos', async (req, res) => {
   const limit = Math.min(Number(req.query.limit ?? 20), 100);
   const offset = Math.max(Number(req.query.offset ?? 0), 0);
 
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const from = typeof req.query.from === 'string' ? req.query.from : '';
+  const to = typeof req.query.to === 'string' ? req.query.to : '';
+
+  // Accept either YYYY-MM-DD or ISO timestamps
+  const fromDate = from ? new Date(from) : null;
+  const toDate = to ? new Date(to) : null;
+
+  const hasFrom = fromDate instanceof Date && !isNaN(fromDate.getTime());
+  const hasTo = toDate instanceof Date && !isNaN(toDate.getTime());
+
+  const where: string[] = [];
+  const params: any[] = [];
+  let i = 1;
+
+  if (q) {
+    // `%` uses pg_trgm similarity; ILIKE covers the non-extension case
+    where.push(`original_filename % $${i} OR original_filename ILIKE '%' || $${i} || '%'`);
+    params.push(q);
+    i++;
+  }
+
+  if (hasFrom) {
+    where.push(`taken_at >= $${i}`);
+    params.push(fromDate);
+    i++;
+  }
+
+  if (hasTo) {
+    where.push(`taken_at <= $${i}`);
+    params.push(toDate);
+    i++;
+  }
+
+  const whereSql = where.length ? `where ${where.join(' and ')}` : '';
+
+  params.push(limit, offset);
+  const limitParam = i++;
+  const offsetParam = i++;
+
   const r = await pool.query(
-    `select id, original_filename, status, gcs_bucket, gcs_object, content_type, size_bytes, created_at, uploaded_at
-     from photos
-     order by created_at desc
-     limit $1 offset $2`,
-    [limit, offset],
+    `
+    select id, original_filename, status, gcs_bucket, gcs_object, content_type, size_bytes,
+           width, height, taken_at, thumb_bucket, thumb_object, processed_at,
+           created_at, uploaded_at
+    from photos
+    ${whereSql}
+    order by created_at desc
+    limit $${limitParam} offset $${offsetParam}
+    `,
+    params,
   );
 
-  res.json({ items: r.rows, limit, offset });
+  res.json({
+    items: r.rows,
+    limit,
+    offset,
+    q: q || null,
+    from: hasFrom ? from : null,
+    to: hasTo ? to : null,
+  });
 });
 
 const port = Number(process.env.PORT ?? 8080);

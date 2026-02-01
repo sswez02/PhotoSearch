@@ -1,8 +1,9 @@
-alter table photos
-  add column if not exists exif_json jsonb,
-  add column if not exists width int,
-  add column if not exists height int,
-  add column if not exists taken_at timestamptz,
-  add column if not exists thumb_bucket text,
-  add column if not exists thumb_object text,
-  add column if not exists processed_at timestamptz;
+ALTER TABLE photos
+  ADD COLUMN IF NOT EXISTS exif_json jsonb,
+  ADD COLUMN IF NOT EXISTS width int,
+  ADD COLUMN IF NOT EXISTS height int,
+  ADD COLUMN IF NOT EXISTS taken_at timestamptz,
+  ADD COLUMN IF NOT EXISTS thumb_bucket text,
+  ADD COLUMN IF NOT EXISTS thumb_object text,
+  ADD COLUMN IF NOT EXISTS processed_at timestamptz;
+
