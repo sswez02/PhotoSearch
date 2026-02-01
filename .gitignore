@@ -26,3 +26,4 @@ logs/
 
 # Misc
 coverage/
+backend/secrets/photosearch-run.key.json
